@@ -27,9 +27,11 @@
 
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors()); // ajuste para restringir a origem do seu dashboard em produção
+app.use(express.json());
 
 const MONDAY_API_URL = "https://api.monday.com/v2";
 const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
@@ -56,6 +58,80 @@ const CSAT_COLS = {
   sugestao: "short_textol1kcacx",
   data: "date6wi0sprc",
 };
+
+// ---------------------------------------------------------------------------
+// Login: e-mails autorizados + senha compartilhada
+// ---------------------------------------------------------------------------
+// IMPORTANTE: para produção, o ideal é mover DASHBOARD_PASSWORD e SESSION_SECRET
+// para variáveis de ambiente na Vercel (Project Settings -> Environment Variables),
+// em vez de deixá-los fixos aqui no código. Os valores abaixo são o padrão caso
+// as variáveis de ambiente não existam.
+const ALLOWED_EMAILS = [
+  "giovanacravo@aceconsultoria.com.br",
+  "luizalapa@aceconsultoria.com.br",
+  "laramagalhaes@aceconsultoria.com.br",
+  "alicebradley@aceconsultoria.com.br",
+  "eng.04@baptistaleal.com.br",
+].map((e) => e.toLowerCase());
+
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "cblace2026*";
+const SESSION_SECRET = process.env.SESSION_SECRET || "troque-este-segredo-nas-variaveis-de-ambiente";
+const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // token de acesso válido por 12 horas
+
+function sign(payload) {
+  return crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+}
+
+// Gera um token assinado (e-mail + validade), sem precisar de banco de dados
+function issueToken(email) {
+  const expires = Date.now() + TOKEN_TTL_MS;
+  const payload = `${email}|${expires}`;
+  const signature = sign(payload);
+  return Buffer.from(`${payload}|${signature}`).toString("base64url");
+}
+
+// Confere assinatura, validade e se o e-mail ainda está na lista autorizada
+function verifyToken(token) {
+  try {
+    const decoded = Buffer.from(token, "base64url").toString("utf8");
+    const [email, expiresStr, signature] = decoded.split("|");
+    if (!email || !expiresStr || !signature) return null;
+
+    const expectedSignature = sign(`${email}|${expiresStr}`);
+    const validSignature =
+      signature.length === expectedSignature.length &&
+      crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature));
+    if (!validSignature) return null;
+
+    if (Date.now() > Number(expiresStr)) return null;
+    if (!ALLOWED_EMAILS.includes(email.toLowerCase())) return null;
+
+    return { email };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Middleware: exige um token válido no header "Authorization: Bearer <token>"
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  const session = token && verifyToken(token);
+  if (!session) return res.status(401).json({ error: "Não autenticado. Faça login novamente." });
+  req.user = session;
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// Anonimização do cliente
+// ---------------------------------------------------------------------------
+// O nome real do cliente nunca deve sair do servidor. Em vez de expor
+// colText(item, NPS_COLS.cliente) / item.name, geramos um identificador
+// neutro e estável, derivado do id interno do item no monday (não do nome).
+function anonymizeClient(itemId) {
+  const digits = String(itemId).slice(-4).padStart(4, "0");
+  return `Cliente #${digits}`;
+}
 
 // ---------------------------------------------------------------------------
 // Cliente GraphQL simples
@@ -109,12 +185,17 @@ function colText(item, columnId) {
   return c ? (c.text || "").trim() : "";
 }
 
-// "MMM/AA" a partir de "YYYY-MM-DD"
+// "MMM/AA" a partir de "YYYY-MM-DD" — já aplicando a competência (mês anterior)
+// Regra combinada com a A.C.E.: uma coleta feita em setembro é sobre a
+// experiência do cliente em agosto, então ela deve ser rotulada e agrupada
+// como "Agosto/2026" em todo o dashboard (KPIs, evolução, filtros, tabelas).
 function monthLabelFromISO(iso) {
   if (!iso) return null;
-  const [y, m] = iso.split("-");
+  let [y, m] = iso.split("-").map(Number);
+  m -= 1; // desloca para o mês de competência (mês anterior à coleta)
+  if (m === 0) { m = 12; y -= 1; }
   const meses = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"];
-  return `${meses[parseInt(m, 10) - 1]}/${y.slice(2)}`;
+  return `${meses[m - 1]}/${String(y).slice(2)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +210,7 @@ async function loadNpsRecords() {
       return {
         data: dataISO,
         mes: monthLabelFromISO(dataISO),
-        cliente: colText(item, NPS_COLS.cliente) || item.name,
+        cliente: anonymizeClient(item.id),
         empreendimento: colText(item, NPS_COLS.empreendimento) || "Não informado",
         nota: notaTxt ? Number(notaTxt) : null,
         comentario: colText(item, NPS_COLS.motivo) || colText(item, NPS_COLS.sugestao) || "",
@@ -147,7 +228,7 @@ async function loadCsatRecords() {
       return {
         data: dataISO,
         mes: monthLabelFromISO(dataISO),
-        cliente: item.name,
+        cliente: anonymizeClient(item.id),
         empreendimento: colText(item, CSAT_COLS.empreendimento) || "Não informado",
         nota: notaTxt ? Number(notaTxt) : null,
         comentario: colText(item, CSAT_COLS.sugestao) || "",
@@ -175,6 +256,26 @@ function sortedMonthKeys(records) {
 // ---------------------------------------------------------------------------
 // Rotas
 // ---------------------------------------------------------------------------
+
+// Rota de login: fica FORA do requireAuth (é ela que gera o token)
+app.post("/login", (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ error: "Informe e-mail e senha." });
+  }
+  const normalizedEmail = String(email).trim().toLowerCase();
+  if (!ALLOWED_EMAILS.includes(normalizedEmail)) {
+    return res.status(401).json({ error: "E-mail não autorizado." });
+  }
+  if (password !== DASHBOARD_PASSWORD) {
+    return res.status(401).json({ error: "Senha incorreta." });
+  }
+  const token = issueToken(normalizedEmail);
+  res.json({ token });
+});
+
+// A partir daqui, toda rota abaixo exige um token válido (ver requireAuth)
+app.use(requireAuth);
 
 app.get("/coletas-nps", async (req, res) => {
   try {
@@ -217,14 +318,22 @@ app.get("/empreendimentos", async (req, res) => {
       if (!groups.has(k)) groups.set(k, { mes: r.mes, empreendimento: r.empreendimento, npsVals: [], csatVals: [] });
       groups.get(k).csatVals.push(r.nota);
     }
-    const rows = [...groups.values()].map((g) => ({
-      mes: g.mes,
-      empreendimento: g.empreendimento,
-      status: "Houve acompanhamento",
-      nps: average(g.npsVals),
-      csat: average(g.csatVals),
-      novos: null, // plugue aqui outra fonte (ex: board de vendas) se tiver esse dado
-    }));
+    const rows = [...groups.values()].map((g) => {
+      const npsValidos = g.npsVals.filter((v) => typeof v === "number");
+      const csatValidos = g.csatVals.filter((v) => typeof v === "number");
+      const partes = [];
+      if (npsValidos.length) partes.push("NPS");
+      if (csatValidos.length) partes.push("CSAT");
+      return {
+        mes: g.mes,
+        empreendimento: g.empreendimento,
+        nps: average(g.npsVals),
+        npsColetas: npsValidos.length,
+        csat: average(g.csatVals),
+        csatColetas: csatValidos.length,
+        acompanhamento: partes.length ? partes.join(" + ") : "Sem coletas",
+      };
+    });
     res.json({ rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -238,8 +347,8 @@ app.get("/nps", async (req, res) => {
     const melhor = Math.max(...values.filter((v) => v !== null));
     res.json({
       kpis: [
-        { label: "NPS médio geral", value: geral ?? "—", foot: `${months.length} meses` },
-        { label: "Melhor mês", value: Number.isFinite(melhor) ? melhor : "—", foot: months[values.indexOf(melhor)] || "" },
+        { label: "NPS médio geral", value: geral ?? "Sem dados", foot: `${months.length} meses` },
+        { label: "Melhor mês", value: Number.isFinite(melhor) ? melhor : "Sem dados", foot: months[values.indexOf(melhor)] || "" },
       ],
       months, values,
     });
@@ -255,8 +364,8 @@ app.get("/csat", async (req, res) => {
     const melhor = Math.max(...values.filter((v) => v !== null));
     res.json({
       kpis: [
-        { label: "CSAT médio geral", value: geral ?? "—", foot: `${months.length} meses` },
-        { label: "Melhor mês", value: Number.isFinite(melhor) ? melhor : "—", foot: months[values.indexOf(melhor)] || "" },
+        { label: "CSAT médio geral", value: geral ?? "Sem dados", foot: `${months.length} meses` },
+        { label: "Melhor mês", value: Number.isFinite(melhor) ? melhor : "Sem dados", foot: months[values.indexOf(melhor)] || "" },
       ],
       months, values,
     });
@@ -277,8 +386,8 @@ app.get("/overview", async (req, res) => {
       monthLabel,
       source: "monday.com — Coleta De NPS - CBL / Formulário de satisfação SAT",
       kpis: [
-        { label: "NPS médio", value: average(npsMes.map((r) => r.nota)) ?? "—", foot: `${npsMes.length} respostas` },
-        { label: "CSAT médio", value: average(csatMes.map((r) => r.nota)) ?? "—", foot: `${csatMes.length} respostas` },
+        { label: "NPS médio", value: average(npsMes.map((r) => r.nota)) ?? "Sem dados", foot: `${npsMes.length} respostas` },
+        { label: "CSAT médio", value: average(csatMes.map((r) => r.nota)) ?? "Sem dados", foot: `${csatMes.length} respostas` },
       ],
       contacts: [
         { label: "Contatos de NPS", value: npsMes.length, desc: "Clientes que responderam a pesquisa de NPS (escala 1–10)." },
